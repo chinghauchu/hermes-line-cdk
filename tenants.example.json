@@ -1,0 +1,25 @@
+{
+  "account": "111111111111",
+  "region": "us-east-1",
+  "domainName": "hermes.example.com",
+  "hostedZoneId": "Z0123456789ABCDEFGHIJ",
+  "hostedZoneName": "example.com",
+  "alertEmailAddress": "you@example.com",
+  "monthlyBudgetUsd": 50,
+  "defaultBedrockModelIds": [
+    "anthropic.claude-sonnet-4-5-20250929-v1:0"
+  ],
+  "hermesImageTag": "latest",
+  "tenants": [
+    {
+      "id": "family",
+      "displayName": "Family Bot",
+      "lineAllowAllUsers": false,
+      "lineAllowedUsers": [],
+      "lineAllowedGroups": [],
+      "lineAllowedRooms": [],
+      "adminLineUserId": "",
+      "monthlyBudgetUsd": 10
+    }
+  ]
+}

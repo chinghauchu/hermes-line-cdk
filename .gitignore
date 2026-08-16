@@ -1,0 +1,19 @@
+*.js
+!jest.config.js
+*.d.ts
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+cdk.context.json
+
+# Real tenant manifest (account id, domain, allowlists) - copy from
+# tenants.example.json and fill in; never commit the real one.
+tenants.json
+
+# Personal local Claude Code permission overrides
+.claude/settings.local.json
+
+__pycache__/
+*.pyc
