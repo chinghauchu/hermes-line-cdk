@@ -98,11 +98,19 @@ export class TenantStack extends Stack {
       onEventHandler: configWriterFn,
     });
 
+    // Manual, explicit-only escape hatch: `cdk deploy -c wipeTenantData=<id>`
+    // wipes that tenant's entire EFS directory before anything else runs.
+    // Never wired to tenants.json — an accidental true here would destroy
+    // real conversation history, so it only exists as a one-shot CLI flag
+    // you have to type on purpose. Remove the flag (or use a different id)
+    // for the next deploy so it doesn't wipe again.
+    const wipeTarget = this.node.tryGetContext("wipeTenantData");
     const configResource = new CustomResource(this, "ConfigYaml", {
       serviceToken: configProvider.serviceToken,
       properties: {
         ModelProvider: "bedrock",
         ModelDefault: modelIds[0],
+        WipeAll: wipeTarget === tenant.id ? "true" : "false",
       },
     });
 
@@ -141,15 +149,34 @@ export class TenantStack extends Stack {
       ],
     });
 
+    // RETAIN, not DESTROY: a failed deploy's CloudFormation rollback
+    // deletes DESTROY-policy resources immediately, which has already once
+    // destroyed the only evidence of why a task failed its health check
+    // before anyone could read it. An orphaned log group after a real
+    // `cdk destroy` is a trivial manual cleanup; losing failure forensics
+    // mid-incident is not.
     const logGroup = new logs.LogGroup(this, "LogGroup", {
       retention: logs.RetentionDays.ONE_MONTH,
-      removalPolicy: RemovalPolicy.DESTROY,
+      removalPolicy: RemovalPolicy.RETAIN,
     });
 
     const container = taskDef.addContainer("hermes", {
       image: ecs.ContainerImage.fromRegistry(`nousresearch/hermes-agent:${appConfig.hermesImageTag}`),
-      command: ["gateway", "run"],
+      // -vv (DEBUG verbosity): temporary, to see what the gateway is doing
+      // during the silent gap between "Gateway Starting..." and the health
+      // check ever passing — every deploy so far has hung there with zero
+      // log output at the default verbosity, on a fresh EFS directory with
+      // no corruption and CPU/memory both idle (not resource starvation).
+      // Drop back to ["gateway", "run"] once the cause is found.
+      command: ["gateway", "run", "-vv"],
       environment: {
+        // Python full-buffers stdout when it isn't a TTY (true for any
+        // piped container process) — with -vv genuinely producing zero
+        // output for 7+ minutes straight through to SIGTERM, whatever
+        // Hermes is logging may just be stuck in that buffer, never
+        // reaching CloudWatch. Forces line-buffered/unbuffered output so
+        // logs show up as they're written instead of only on a full flush.
+        PYTHONUNBUFFERED: "1",
         HERMES_UID: SharedStack.HERMES_UID,
         HERMES_GID: SharedStack.HERMES_GID,
         // Closed by default — see docs/DESIGN.md section on access control.
@@ -197,12 +224,27 @@ export class TenantStack extends Stack {
       // seconds of downtime during redeploys is a fine trade for that.
       minHealthyPercent: 0,
       maxHealthyPercent: 100,
+      // AZ Rebalancing (CDK default: ENABLED) requires maximumPercent > 100
+      // to give itself headroom to shuffle tasks across AZs — incompatible
+      // with the hard single-task-at-a-time guarantee above, and pointless
+      // for a desiredCount: 1 service anyway (nothing to rebalance).
+      availabilityZoneRebalancing: ecs.AvailabilityZoneRebalancing.DISABLED,
       // Without this, the ALB can start health-checking (and the circuit
       // breaker can start counting failures) before Hermes has finished
       // initializing its plugins and bound the LINE webhook port, tripping
       // the circuit breaker on a task that would have become healthy given
       // more time.
-      healthCheckGracePeriod: Duration.seconds(120),
+      // Cold start (loading bundled skills, Playwright's headless Chromium,
+      // etc.) took ~5m52s on a verified deploy with zero log output during
+      // that stretch even at -vv — 120s was too short and looked like a
+      // hang, tripping the circuit breaker every time. 10 minutes leaves
+      // headroom above the observed cold-start time.
+      healthCheckGracePeriod: Duration.minutes(10),
+      // Lets you `aws ecs execute-command` into the running container for
+      // ad-hoc debugging/maintenance (e.g. clearing a corrupted state.db).
+      // CDK auto-grants the task role the ssmmessages:* permissions this
+      // needs — no manual IAM policy required.
+      enableExecuteCommand: true,
     });
     // Ordering only (see MODEL_CONFIG_VERSION above for what actually
     // forces a redeploy when the model changes): make sure config.yaml is

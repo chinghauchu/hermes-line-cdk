@@ -107,8 +107,9 @@ Route53(網域)→ ALB(公開,ACM TLS 憑證)
 - **健康檢查 endpoint 已確認**:`GET /line/webhook/health`(原始碼 `self._app.router.add_get(f"{self.webhook_path}/health", ...)`),已經接進 TargetGroup 的健康檢查
 - **Webhook 路徑是固定的,不能用 path 分租戶**:預設值 `/line/webhook`(`DEFAULT_WEBHOOK_PATH`),而且不是每租戶可各自設定的環境變數,只能透過 `config.yaml` 覆寫。因此改成**每租戶一個子網域**(`{tenantId}.{domainName}`)、ALB 用 Host header 分流,而不是原本設想的 path prefix——見 `lib/tenant-stack.ts` 的註解
 - **`state.db` 的實際路徑**:根據 `docker-compose.yml` 的 `~/.hermes:/opt/data` 掛載方式推斷是直接在掛載根目錄(`/opt/data/state.db`),`lambda/usage-aggregator` 照這個假設寫,**部署後第一次跑月報時務必驗證**
-- **EFS 上 SQLite 併發寫入已經實際踩到問題**:部署過程中新舊 task 短暫重疊(原本 `maxHealthyPercent: 200`)導致兩個 process 同時碰同一顆 `state.db`,Hermes 回報「session storage could not be written」並拒絕該輪對話(算是它自己的安全機制,沒有真的寫壞資料,只是拒絕冒險)。已改成 `maxHealthyPercent: 100`,部署時強制先關舊 task 才開新的,保證同時間只有一個 process 碰這個租戶的 EFS,不再有這個風險
+- **EFS 上 SQLite 併發寫入已經實際踩到問題,而且比預期嚴重**:部署過程中新舊 task 短暫重疊(原本 `maxHealthyPercent: 200`)導致兩個 process 同時碰同一顆 `state.db`。一開始只看到「session storage could not be written」這種安全拒絕,後來直接演變成 `database disk image is malformed`——**檔案真的壞了,而且壞掉的 DB 會讓 Hermes 開機/健康檢查一直過不了**,導致新的、乾淨的部署也一直失敗(卡在一個「task 起不來 → 沒辦法 exec 進去手動修 → 只能等下一次部署,但部署又因為同一個原因失敗」的迴圈)。已做兩層修正:①`maxHealthyPercent: 100` + 關閉 `availabilityZoneRebalancing`,部署時強制先關舊 task 才開新的,不會再有兩個 process 同時碰同一顆檔案;②`write-tenant-config` Lambda 在 Fargate 啟動前,用 `PRAGMA integrity_check` 檢查 `state.db`,壞掉就自動改名隔離(不是刪除),讓 Hermes 開機時建一個全新的——這樣即使未來又發生一次類似的損毀,部署本身也能自我修復,不會卡死
 - Bedrock model 存取:已在 `ap-northeast-1` 用 `qwen.qwen3-next-80b-a3b` 實際驗證成功
+- **`config.yaml` 沒帶版本標記會讓 Hermes 開機卡死**:我們自己寫的 `config.yaml` 只有 `model:` 區塊,沒有 `_config_version` 欄位。Hermes 的 `cont-init` 階段偵測到「沒有版本標記」會判定成一份兩年前的舊設定、印出「can no longer be auto-migrated」的警告,接著在這個非互動式環境下**整個 gateway process 卡住,7 分鐘以上完全沒有 log 輸出,最後被 ECS 健康檢查判定失敗而砍掉**——不是慢,是真的卡死,調高健康檢查寬限期也沒用。修法是警告訊息裡自己講的:在 `config.yaml` 加上 `_config_version: 12`,`write-tenant-config` Lambda 已經補上這個欄位
 
 ## 5a. 部署前你需要準備/決定的事
 
