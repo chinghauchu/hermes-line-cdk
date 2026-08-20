@@ -111,6 +111,17 @@ export class TenantStack extends Stack {
         ModelProvider: "bedrock",
         ModelDefault: modelIds[0],
         WipeAll: wipeTarget === tenant.id ? "true" : "false",
+        // "off" — Hermes's default browser backend expects a real desktop
+        // Chrome with a human to click its permission popup, which doesn't
+        // exist on headless Fargate; this reverts to the built-in
+        // browser_* tools instead. See lambda/write-tenant-config/index.py.
+        BrowserBackend: "off",
+        // Bump whenever write-tenant-config's Lambda code changes what it
+        // writes to EFS without also changing a property above — since
+        // properties are otherwise unchanged, CloudFormation would
+        // otherwise see no diff and skip re-invoking this custom resource,
+        // silently leaving the new Lambda code's output un-run.
+        WriterVersion: "3",
       },
     });
 
@@ -133,8 +144,17 @@ export class TenantStack extends Stack {
 
     // ---- Task definition + container ------------------------------------
     const taskDef = new ecs.FargateTaskDefinition(this, "TaskDef", {
-      cpu: 256,
-      memoryLimitMiB: 512,
+      // Bumped from 256/512 (0.25 vCPU) — that was too little to run actual
+      // Chromium-based browser automation alongside the gateway's own web
+      // server: a real page render starved the CPU badly enough that the
+      // ALB health check itself stopped responding ("Request timed out"),
+      // and ECS killed the task mid-task. 1024/2048 (1 vCPU) is a generous
+      // starting point to first confirm the browser tools work at all;
+      // scale back down once there's headroom data to size it properly.
+      // ~$45/mo at this size in ap-northeast-1 vs. ~$11/mo at 256/512 —
+      // see conversation for the full breakdown.
+      cpu: 1024,
+      memoryLimitMiB: 2048,
       taskRole,
       executionRole,
       volumes: [
@@ -168,7 +188,17 @@ export class TenantStack extends Stack {
       // log output at the default verbosity, on a fresh EFS directory with
       // no corruption and CPU/memory both idle (not resource starvation).
       // Drop back to ["gateway", "run"] once the cause is found.
-      command: ["gateway", "run", "-vv"],
+      //
+      // Runs /opt/data/start.sh (written by write-tenant-config onto EFS)
+      // instead of `gateway` directly — it warms agent-browser's npx cache
+      // before exec-ing gateway. An earlier attempt to inline that as
+      // `["sh", "-c", "<script>"]` here hit exit 127 on boot: passing a
+      // non-"gateway" argv[0] through docker/main-wrapper.sh's "bare
+      // executable passthrough" branch didn't carry the venv-activated
+      // PATH through reliably. A real script file, invoked as a single
+      // bare executable path (matching the same branch `gateway` alone
+      // always used), sidesteps that — see start.sh's own absolute paths.
+      command: ["/opt/data/start.sh"],
       environment: {
         // Python full-buffers stdout when it isn't a TTY (true for any
         // piped container process) — with -vv genuinely producing zero
@@ -179,6 +209,17 @@ export class TenantStack extends Stack {
         PYTHONUNBUFFERED: "1",
         HERMES_UID: SharedStack.HERMES_UID,
         HERMES_GID: SharedStack.HERMES_GID,
+        // Hermes auto-adds --no-sandbox for Chromium only when it detects
+        // it's running in a container (_needs_chromium_sandbox_bypass() in
+        // tools/browser_tool.py checks for root euid, /.dockerenv, or
+        // "docker" in /proc/1/cgroup). Fargate runs on containerd/Firecracker,
+        // not Docker, and this task runs as non-root (HERMES_UID), so none of
+        // those checks trip — Chromium then tries to sandbox itself the
+        // normal way and fails to launch at all ("no supported browser...
+        // can be launched"), breaking any skill/cron job that needs a
+        // browser (e.g. flight-price monitoring). Set explicitly instead of
+        // relying on the auto-detection.
+        AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage",
         // Closed by default — see docs/DESIGN.md section on access control.
         // Flip via tenants.json + redeploy, or the bootstrap flow in
         // docs/LINE_INTEGRATION.md to discover userIds for the allowlist.
